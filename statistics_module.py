@@ -15,19 +15,74 @@ def get_sales_statistics():
     try:
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         
+        # 调试：检查数据库中的基本数据
+        cursor.execute("SELECT COUNT(*) as count FROM orders")
+        total_orders = cursor.fetchone()['count']
+        print(f"数据库总订单数: {total_orders}")
+        
+        cursor.execute("SELECT COUNT(*) as count FROM order_detail")
+        total_details = cursor.fetchone()['count']
+        print(f"数据库订单详情数: {total_details}")
+        
+        cursor.execute("SELECT COUNT(*) as count FROM goods")
+        total_goods = cursor.fetchone()['count']
+        print(f"数据库商品数: {total_goods}")
+        
+        # 检查今日数据
+        today = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute("SELECT COUNT(*) as count FROM orders WHERE DATE(create_time) = %s", [today])
+        today_orders = cursor.fetchone()['count']
+        print(f"今日订单数: {today_orders}")
+        
+        cursor.execute("SELECT SUM(total_amount) as total FROM orders WHERE DATE(create_time) = %s AND status != 'cancelled'", [today])
+        today_sales = cursor.fetchone()['total']
+        print(f"今日销售额: {today_sales}")
+        
+        # 如果没有数据，返回空数据
+        if total_orders == 0:
+            return jsonify({
+                "code": 1,
+                "msg": "获取成功",
+                "data": {
+                    "overall_stats": {
+                        'total_sales': 0.0,
+                        'total_orders': 0,
+                        'avg_order_value': 0.0,
+                        'unique_customers': 0
+                    },
+                    "category_stats": [],
+                    "daily_trends": [],
+                    "period": {
+                        "start_date": start_date,
+                        "end_date": end_date
+                    }
+                }
+            })
+        
         # 根据时间范围构建查询条件
         if period == 'today':
             start_date = datetime.now().strftime('%Y-%m-%d')
             end_date = datetime.now().strftime('%Y-%m-%d')
+            where_clause = "WHERE DATE(o.create_time) = %s AND o.status != 'cancelled'"
+            params = [start_date]
         elif period == '7days':
             start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
             end_date = datetime.now().strftime('%Y-%m-%d')
+            where_clause = "WHERE DATE(o.create_time) BETWEEN %s AND %s AND o.status != 'cancelled'"
+            params = [start_date, end_date]
         elif period == 'month':
             start_date = datetime.now().replace(day=1).strftime('%Y-%m-%d')
             end_date = datetime.now().strftime('%Y-%m-%d')
+            where_clause = "WHERE DATE(o.create_time) BETWEEN %s AND %s AND o.status != 'cancelled'"
+            params = [start_date, end_date]
+        else:
+            # 默认查询所有数据
+            where_clause = "WHERE o.status != 'cancelled'"
+            params = []
         
-        where_clause = "WHERE DATE(o.create_time) BETWEEN %s AND %s AND o.status != 'cancelled'"
-        params = [start_date, end_date]
+        print(f"查询条件: {where_clause}")
+        print(f"查询参数: {params}")
+        print(f"当前日期: {datetime.now().strftime('%Y-%m-%d')}")
         
         # 总体统计
         cursor.execute(f"""
@@ -47,13 +102,21 @@ def get_sales_statistics():
             overall_stats['total_orders'] = int(overall_stats['total_orders'] or 0)
             overall_stats['avg_order_value'] = float(overall_stats['avg_order_value'] or 0)
             overall_stats['unique_customers'] = int(overall_stats['unique_customers'] or 0)
+        else:
+            # 如果没有数据，返回默认值
+            overall_stats = {
+                'total_sales': 0.0,
+                'total_orders': 0,
+                'avg_order_value': 0.0,
+                'unique_customers': 0
+            }
         
         # 按商品种类统计
         cursor.execute(f"""
             SELECT 
                 c.category_name,
-                SUM(od.quantity) as total_quantity,
-                SUM(od.subtotal) as total_sales,
+                COALESCE(SUM(od.quantity), 0) as total_quantity,
+                COALESCE(SUM(od.subtotal), 0) as total_sales,
                 COUNT(DISTINCT od.order_id) as order_count
             FROM order_detail od
             LEFT JOIN goods g ON od.goods_id = g.goods_id
@@ -71,7 +134,7 @@ def get_sales_statistics():
             SELECT 
                 DATE(o.create_time) as sale_date,
                 COUNT(*) as daily_orders,
-                SUM(o.total_amount) as daily_sales
+                COALESCE(SUM(o.total_amount), 0) as daily_sales
             FROM orders o 
             {where_clause}
             GROUP BY DATE(o.create_time)
@@ -155,10 +218,10 @@ def export_sales_data():
             cursor.execute(f"""
                 SELECT 
                     c.category_name,
-                    SUM(od.quantity) as total_quantity,
-                    SUM(od.subtotal) as total_sales,
+                    COALESCE(SUM(od.quantity), 0) as total_quantity,
+                    COALESCE(SUM(od.subtotal), 0) as total_sales,
                     COUNT(DISTINCT od.order_id) as order_count,
-                    AVG(od.price) as avg_price
+                    COALESCE(AVG(od.price), 0) as avg_price
                 FROM order_detail od
                 LEFT JOIN goods g ON od.goods_id = g.goods_id
                 LEFT JOIN category c ON g.category_id = c.category_id
@@ -221,10 +284,10 @@ def get_top_selling_goods():
             SELECT 
                 g.goods_name,
                 c.category_name,
-                SUM(od.quantity) as total_quantity,
-                SUM(od.subtotal) as total_sales,
+                COALESCE(SUM(od.quantity), 0) as total_quantity,
+                COALESCE(SUM(od.subtotal), 0) as total_sales,
                 COUNT(DISTINCT od.order_id) as order_count,
-                AVG(od.price) as avg_price
+                COALESCE(AVG(od.price), 0) as avg_price
             FROM order_detail od
             LEFT JOIN goods g ON od.goods_id = g.goods_id
             LEFT JOIN category c ON g.category_id = c.category_id

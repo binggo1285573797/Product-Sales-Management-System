@@ -166,35 +166,73 @@
 
 #### 核心组件
 
-##### 1. AIService类 (ai_service.py)
+##### 1. LLMClient类 (ai_service.py)
 ```python
-class AIService:
-    """AI服务类 - 集成SiliconFlow API"""
+class LLMClient:
+    """通用LLM客户端，支持重试与严格JSON输出清洗"""
     
-    def __init__(self):
-        self.api_url = "https://api.siliconflow.cn/v1/chat/completions"
-        self.api_key = "your-api-key"
+    def __init__(self, use_siliconflow: bool = True):
+        # 直接使用SiliconFlow配置
+        self.base_url = "https://api.siliconflow.cn/v1/chat/completions"
+        self.api_key = "sk-vfxewwbfcgthjjabvksdrezxdvtwqjmpdglubfthmzinlren"
+        self.model = "moonshotai/Kimi-K2-Instruct-0905"
+        self.timeout = 60
+        self.retry_count = 3
     
-    def enhance_query_parsing(self, query_text, database_context=None):
-        """AI增强查询解析"""
-        # 1. AI识别查询类型
-        # 2. 查询数据库获取实际数据
-        # 3. 生成自然语言解释
-        # 4. 返回结构化结果
+    def chat(self, messages, max_tokens=1024, temperature=0.3):
+        """调用LLM API，支持重试机制"""
+        # 实现带重试的API调用
     
-    def generate_query_explanation(self, query_text, query_result):
-        """生成自然语言解释"""
-        # 基于查询结果生成专业解释
+    @staticmethod
+    def extract_json_block(text):
+        """从json代码块中提取JSON内容"""
+        # 从文本中提取JSON块
 ```
 
-##### 2. 智能问数接口 (ai_module.py)
+##### 2. AIService类 (ai_service.py)
 ```python
-def intelligent_query():
-    """智能问数接口"""
-    # 1. 接收用户查询
-    # 2. 调用AI服务解析
-    # 3. 记录查询日志
-    # 4. 返回查询结果
+class AIService:
+    """封装智能问数与销量预测功能"""
+    
+    def __init__(self):
+        self.client = LLMClient(use_siliconflow=True)
+    
+    def analyze_query(self, query_text):
+        """分析用户查询，提取时间范围、商品种类和查询指标"""
+        # 使用正则表达式匹配时间、指标等
+    
+    def build_query_sql(self, parsed_query, categories):
+        """构建SQL查询语句"""
+        # 根据解析结果构建安全的SQL查询
+    
+    def process_query_with_llm(self, query_text, csv_path, metric):
+        """使用LLM处理查询并生成自然语言解释"""
+        # 调用LLM生成专业的数据分析报告
+```
+
+##### 3. 智能问数接口 (ai_module.py)
+```python
+def intelligent_query(query_text: str, user_id: int):
+    """处理智能问数请求"""
+    # 1. 分析用户查询
+    parsed_query = sales_ai_service.analyze_query(query_text)
+    
+    # 2. 获取数据库连接和商品种类
+    categories = sales_ai_service.get_categories_from_db(cursor)
+    
+    # 3. 构建SQL并执行查询
+    sql, params, metric = sales_ai_service.build_query_sql(parsed_query, categories)
+    
+    # 4. 导出数据到CSV
+    csv_path = sales_ai_service.export_query_data_to_csv(...)
+    
+    # 5. 使用LLM处理查询
+    llm_result = sales_ai_service.process_query_with_llm(...)
+    
+    # 6. 写入查询日志
+    save_query_log(user_id, query_text, llm_result["data"])
+    
+    return result
 ```
 
 ### 🚀 快速开始
@@ -303,47 +341,116 @@ Content-Type: application/json
 #### SiliconFlow API配置
 网址：https://www.siliconflow.cn/
 ```python
-# ai_service.py
-SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
-SILICONFLOW_API_KEY = "your-api-key-here"
+# ai_service.py 中的 LLMClient 类，直接集成配置
+class LLMClient:
+    def __init__(self, use_siliconflow: bool = True):
+        if use_siliconflow:
+            self.base_url = "https://api.siliconflow.cn/v1/chat/completions"
+            self.api_key = "sk-vfxewwbfcgthjjabvksdrezxdvtwqjmpdglubfthmzinlren"  # 已配置
+            self.model = "moonshotai/Kimi-K2-Instruct-0905"  # 当前使用模型
+            self.timeout = 60
+            self.retry_count = 3
 
-# 支持的模型
-MODELS = [
-    "Qwen/QwQ-32B",      # 推荐模型，性能最佳
-    "Qwen/QwQ-14B",      # 备选模型，平衡性能
-    "Qwen/QwQ-7B"        # 轻量模型，快速响应
-]
+# 支持的模型(可在SiliconFlow平台切换)
+模型选择：
+- "moonshotai/Kimi-K2-Instruct-0905"  # 当前使用，中文支持好
+- "Qwen/QwQ-32B"                      # 推荐模型，性能最佳
+- "Qwen/QwQ-14B"                      # 备选模型，平衡性能
+- "Qwen/Qwen2.5-Coder-32B-Instruct"   # 编程专用模型
 ```
 
-#### 环境变量配置
-```bash
-# 设置API密钥
-export SILICONFLOW_API_KEY="your-api-key-here"
+#### 无需环境变量配置
+根据项目记忆，API配置已直接集成在ai_service.py中，无需额外的环境变量配置。
 
-# 设置API URL（可选）
-export SILICONFLOW_API_URL="https://api.siliconflow.cn/v1/chat/completions"
+### 💪 增强功能
+
+#### 智能时间识别
+系统支持多种时间表达形式：
+- **相对时间**: 今天、昨天、最近N天
+- **绝对时间**: 本月、今年、具体年月
+- **智能匹配**: 使用正则表达式自动提取时间条件
+
+#### 商品种类智能匹配
+```python
+def match_category_by_query(self, query_text, categories):
+    """根据查询文本匹配商品种类"""
+    query_lower = query_text.lower()
+    for category in categories:
+        if category['category_name'].lower() in query_lower:
+            return category
+    return None
+```
+
+#### 安全SQL构建
+系统使用参数化查询防止SQL注入：
+```python
+# 构建安全的WHERE子句
+where_clauses = ["o.status IN ('shipped', 'completed')"]
+params = []
+
+if time_type == 'recent':
+    days = time_data.get('days', 7)
+    where_clauses.append("o.create_time >= DATE_SUB(NOW(), INTERVAL %s DAY)")
+    params.append(days)
+
+if category_id:
+    where_clauses.append("g.category_id = %s")
+    params.append(category_id)
+```
+
+#### 错误处理增强
+根据经验记忆，系统增强了对None值的安全处理：
+```python
+# 安全的字段检查
+time_data = parsed_query.get('time')
+metric = parsed_query.get('metric')
+
+if not time_data:
+    return {"code": 0, "msg": "请补充时间范围", "data": {}}
+elif not metric:
+    return {"code": 0, "msg": "请明确查询指标", "data": {}}
+
+# 安全的对象访问
+category_data = parsed_query.get('category')
+category_id = category_data.get('category_id') if category_data else None
 ```
 
 ### 🛠️ 自定义配置
 
 #### 1. 添加新的查询类型
+在 ai_service.py 的 analyze_query 方法中修改 metric_patterns：
 ```python
-# 在 ai_service.py 的 enhance_query_parsing 方法中添加
-sql_map = {
-    "销售额": "SELECT SUM(total_amount) AS value FROM orders WHERE status != 'cancelled'",
-    "销量": "SELECT SUM(od.quantity) AS value FROM order_detail od JOIN orders o ON od.order_id = o.order_id WHERE o.status != 'cancelled'",
+metric_patterns = {
+    'sales': [r'销售额|销售金额|营业额|营收|收入'],
+    'quantity': [r'销量|销售量|数量|件数|台数'],
+    'orders': [r'订单数|订单量|订单|单数'],
+    'customers': [r'客户数|用户数|客户|用户|买家数'],
     # 添加新的查询类型
-    "平均订单金额": "SELECT AVG(total_amount) AS value FROM orders WHERE status != 'cancelled'",
-    "新查询类型": "YOUR_SQL_QUERY_HERE"
+    'avg_order': [r'平均订单|平均金额']
 }
 ```
 
-#### 2. 自定义AI提示词
+同时在 build_query_sql 方法中添加相应的SQL语句：
 ```python
-# 修改 system_prompt 以支持更多查询类型
-system_prompt = """你是专业的销售数据分析助手。请根据用户问题识别他们想要查询的数据类型。
-只返回一个JSON：
-{"info": "销售额/销量/订单数/客户数/商品种类/平均订单金额/新查询类型"}"""
+elif metric == 'avg_order':
+    select_clause = "AVG(o.total_amount) AS value"
+    from_clause = "FROM orders o"
+```
+
+#### 2. 自定义AI提示词
+在 generate_query_prompt 方法中修改提示词：
+```python
+prompt = f"""你是专业的销售数据分析师。请基于用户问题和CSV数据，生成精准的回答。
+
+用户问题：{query_text}
+
+CSV数据内容：
+{csv_content}
+
+请按照以下要求输出JSON格式：
+{json_format}
+
+请严格按照JSON格式输出，不要包含其他无关内容。"""
 ```
 
 #### 3. 自定义解释模板
@@ -358,7 +465,62 @@ system_prompt = """你是专业的销售数据分析师。请基于用户问题�
 字数在80~120字之间。"""
 ```
 
-### 🐛 故障排除
+### 📊 销量预测功能
+
+#### 预测流程
+1. **导出历史数据**: 从数据库获取近6个月的销售数据
+2. **数据预处理**: 按商品种类聚合，计算数据完整性
+3. **AI分析**: 使用LLM分析趋势和周期规律
+4. **生成预测**: 输出未来1个月各种类的销量预测
+5. **增强处理**: 基于业务逻辑修正预测结果
+
+#### 关键特性
+```python
+def sales_prediction():
+    """执行销量预测"""
+    # 1. 导出历史销售数据
+    historical_data_path = sales_ai_service.export_historical_sales_data(cursor)
+    
+    # 2. 使用LLM处理预测
+    llm_result = sales_ai_service.process_prediction_with_llm(historical_data_path)
+    
+    # 3. 增强预测结果
+    enhanced_predictions = sales_ai_service.enhance_predictions(predictions, base_sales_dict)
+    
+    # 4. 保存预测结果
+    save_prediction_results(enhanced_predictions)
+```
+
+#### 预测结果结构
+```json
+{
+  "predictions": [
+    {
+      "category_id": 1,
+      "category_name": "手机",
+      "predicted_sales": 150,
+      "demand_level": "high",
+      "growth_rate": 12.5,
+      "confidence": 0.85,
+      "ai_enhanced": true
+    }
+  ]
+}
+```
+
+#### 需求等级划分
+- **high**: 预测值高于历史平均值
+- **medium**: 预测值接近历史平均值  
+- **low**: 预测值低于历史平均值
+
+#### 置信度计算
+```python
+# 根据数据完整性计算置信度
+if data_completeness >= 90:
+    confidence = 0.9
+else:
+    confidence = max(0.5, 0.9 - (90 - data_completeness) * 0.01)
+```
 
 #### 常见问题
 
@@ -412,19 +574,34 @@ print(f"数据库查询结果: {data_value}")
 ### 🔒 安全考虑
 
 #### 1. API密钥安全
-- 不要在代码中硬编码API密钥
-- 使用环境变量存储敏感信息
-- 定期轮换API密钥
+- ✅ **直接集成**: 根据项目规范，API配置直接集成在ai_service.py中
+- ✅ **客户端隐藏**: API密钥不暴露给前端
+- ⚠️ **定期更新**: 建议定期更新SiliconFlow API密钥
 
 #### 2. 输入验证
-- 验证用户输入长度和格式
-- 防止SQL注入攻击
-- 过滤恶意查询内容
+```python
+# 查询内容验证
+if not query_text or len(query_text.strip()) == 0:
+    return {"code": 0, "msg": "查询内容不能为空"}
+
+if len(query_text) > 500:  # 限制查询长度
+    return {"code": 0, "msg": "查询内容过长"}
+
+# SQL注入防护——使用参数化查询
+cursor.execute(sql, params)  # 不直接拼接SQL字符串
+```
 
 #### 3. 错误处理
-- 不暴露敏感错误信息
-- 记录详细日志用于调试
-- 实现优雅的错误降级
+```python
+# 安全的错误消息处理
+def safe_format_error(error_msg: str) -> str:
+    """安全地格式化错误消息，避免包含花括号的内容导致格式化错误"""
+    return str(error_msg).replace('{', '{{').replace('}', '}}')
+
+# 不暴露敏感错误信息
+except Exception as e:
+    return {"code": 0, "msg": f"处理查询失败: {safe_format_error(str(e))}", "data": {}}
+```
 
 ### 📈 监控和日志
 

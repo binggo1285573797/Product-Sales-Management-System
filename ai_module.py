@@ -1,713 +1,610 @@
-from flask import request, jsonify, session
-import pymysql
-import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AI模块 - 智能问数和销量预测功能实现
+"""
+
 import json
+import os
+import logging
+from datetime import datetime
 from decimal import Decimal
-from datetime import datetime, timedelta
-from app import get_db_connection, login_required
-from ai_service import ai_service, get_database_context, get_historical_sales_data
 
-# 自定义JSON编码器，处理Decimal类型
-class DecimalEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Decimal):
-            return float(obj)
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        return super(DecimalEncoder, self).default(obj)
+import pymysql
 
-def intelligent_query():
-    """智能问数 - 使用AI增强的自然语言查询销售数据"""
-    data = request.get_json()
-    query_text = data.get('query_text', '').strip()
+from ai_service import sales_ai_service, DecimalEncoder
+from app import get_db_connection
+
+def ensure_dirs():
+    """确保必要的目录存在"""
+    base_dirs = [
+        "data",
+        os.path.join("data", "ai_query", "temp"),
+        os.path.join("data", "ai_forecast", "temp"),
+    ]
+    for d in base_dirs:
+        os.makedirs(d, exist_ok=True)
+
+def get_data_paths():
+    """获取数据路径配置"""
+    return {
+        "ai_query_temp": os.path.join("data", "ai_query", "temp"),
+        "ai_forecast_temp": os.path.join("data", "ai_forecast", "temp")
+    }
+
+def safe_format_error(error_msg: str) -> str:
+    """安全地格式化错误消息，避免包含花括号的内容导致格式化错误"""
+    return str(error_msg).replace('{', '{{').replace('}', '}}')
+
+# ===== 智能问数模块 =====
+def intelligent_query(query_text: str, user_id: int) -> dict:
+    """处理智能问数请求
     
-    if not query_text:
-        return jsonify({"code": 0, "msg": "查询内容不能为空"})
-    
+    Args:
+        query_text: 用户的自然语言问题
+        user_id: 用户ID
+        
+    Returns:
+        dict: 包含code、msg和data的响应结果
+    """
     try:
-        # 使用新的AI服务进行查询解析和数据库查询
-        ai_result = ai_service.enhance_query_parsing(query_text)
+        # 1. 分析用户查询
+        parsed_query = sales_ai_service.analyze_query(query_text)
+        if not parsed_query.get('success', False):
+            # 检查失败原因
+            time_data = parsed_query.get('time')
+            metric = parsed_query.get('metric')
+            
+            if not time_data:
+                return {"code": 0, "msg": "请补充时间范围", "data": {}}
+            elif not metric:
+                return {"code": 0, "msg": "请明确查询指标（如销售额、销量、订单数等）", "data": {}}
+            else:
+                return {"code": 0, "msg": "无法解析查询内容，请尝试重新表述", "data": {}}
         
-        if not ai_result["success"]:
-            return jsonify({
-                "code": 0, 
-                "msg": f"AI解析失败：{ai_result.get('error', '未知错误')}"
-            })
-        
-        # 记录查询日志
+        # 2. 获取数据库连接和商品种类
         conn = get_db_connection()
         try:
             cursor = conn.cursor(pymysql.cursors.DictCursor)
-            cursor.execute(
-                "INSERT INTO query_log (user_id, query_text, query_result) VALUES (%s, %s, %s)",
-                (session.get('user_id'), query_text, str(ai_result))
-            )
-            conn.commit()
+            
+            # 获取所有商品种类
+            categories = sales_ai_service.get_categories_from_db(cursor)
+            
+            # 匹配用户查询中的商品种类
+            matched_category = sales_ai_service.match_category_by_query(query_text, categories)
+            if matched_category:
+                parsed_query['category'] = matched_category
+        except Exception as e:
+            return {"code": 0, "msg": f"数据库查询失败: {safe_format_error(str(e))}", "data": {}}
         finally:
             conn.close()
         
-        return jsonify({
-            "code": 1,
-            "msg": "查询成功",
-            "data": {
-                "query_text": query_text,
-                "info_type": ai_result.get("info"),
-                "data_value": ai_result.get("data"),
-                "explanation": ai_result.get("explanation"),
-                "ai_enhanced": True
-            }
-        })
+        # 3. 构建SQL并执行查询
+        sql, params, metric = sales_ai_service.build_query_sql(parsed_query, categories)
         
-    except Exception as e:
-        return jsonify({"code": 0, "msg": f"查询失败：{str(e)}"})
-
-def get_query_history():
-    """获取查询历史记录"""
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        
-        cursor.execute("""
-            SELECT 
-                query_text,
-                query_result,
-                query_time
-            FROM query_log
-            WHERE user_id = %s
-            ORDER BY query_time DESC
-            LIMIT 20
-        """, (session.get('user_id'),))
-        
-        history = cursor.fetchall()
-        
-        return jsonify({
-            "code": 1,
-            "msg": "获取成功",
-            "data": history
-        })
-        
-    except Exception as e:
-        return jsonify({"code": 0, "msg": f"获取失败：{str(e)}"})
-    finally:
-        conn.close()
-
-def query_actual_data_from_database(ai_info, cursor):
-    """根据AI解析的info字段查询数据库获取实际数据"""
-    print(f"查询数据库获取实际数据: {ai_info}")
-    
-    try:
-        # 根据info内容判断查询类型并查询数据库获取实际数据
-        if ai_info in ["收入", "销售额", "销售金额", "营业额", "营收"]:
-            cursor.execute("SELECT SUM(total_amount) as total_sales FROM orders WHERE status != 'cancelled'")
-            result = cursor.fetchone()
-            return str(result['total_sales'] or 0) if result else "0"
-            
-        elif ai_info in ["销量", "销售量", "数量", "件数", "台数"]:
-            cursor.execute("SELECT SUM(quantity) as total_quantity FROM order_detail od JOIN orders o ON od.order_id = o.order_id WHERE o.status != 'cancelled'")
-            result = cursor.fetchone()
-            return str(result['total_quantity'] or 0) if result else "0"
-            
-        elif ai_info in ["订单数", "订单量", "订单", "单数"]:
-            cursor.execute("SELECT COUNT(*) as total_orders FROM orders WHERE status != 'cancelled'")
-            result = cursor.fetchone()
-            return str(result['total_orders'] or 0) if result else "0"
-            
-        elif ai_info in ["客户数", "用户数", "客户", "用户", "买家数"]:
-            cursor.execute("SELECT COUNT(DISTINCT user_id) as total_customers FROM orders WHERE status != 'cancelled'")
-            result = cursor.fetchone()
-            return str(result['total_customers'] or 0) if result else "0"
-            
-        elif ai_info in ["商品种类"]:
-            cursor.execute("SELECT category_name FROM category WHERE status = 1 LIMIT 5")
-            categories = cursor.fetchall()
-            if categories:
-                return ", ".join([cat['category_name'] for cat in categories])
-            else:
-                return "暂无商品种类"
-                
-        elif ai_info in ["今天", "今日", "当天"]:
-            return "今天"
-        elif ai_info in ["昨天", "昨日", "前一天"]:
-            return "昨天"
-        elif "最近" in ai_info and "天" in ai_info:
-            import re
-            days_match = re.search(r'(\d+)', ai_info)
-            days = int(days_match.group(1)) if days_match else 7
-            return f"最近{days}天"
-        elif ai_info in ["本月", "这个月", "当月"]:
-            return "本月"
-        elif ai_info in ["今年", "本年", "当年"]:
-            return "今年"
-        elif "年" in ai_info and "月" in ai_info:
-            return ai_info
-        else:
-            # 可能是商品种类
-            cursor.execute("SELECT category_name FROM category WHERE category_name = %s", (ai_info,))
-            category_result = cursor.fetchone()
-            if category_result:
-                return category_result['category_name']
-            else:
-                return ai_info
-                
-    except Exception as e:
-        print(f"查询数据库数据失败: {e}")
-        return ai_info
-
-def build_query_from_info(ai_info, actual_data, query_text, cursor):
-    """根据AI返回的info字段构建查询参数"""
-    print(f"AI解析信息: {ai_info}, 实际数据: {actual_data}")
-    
-    # 初始化查询参数
-    time_info = None
-    category_info = None
-    metric = None
-    
-    # 根据info内容判断查询类型
-    if ai_info in ["收入", "销售额", "销售金额", "营业额", "营收"]:
-        metric = "sales"
-    elif ai_info in ["销量", "销售量", "数量", "件数", "台数"]:
-        metric = "quantity"
-    elif ai_info in ["订单数", "订单量", "订单", "单数"]:
-        metric = "orders"
-    elif ai_info in ["客户数", "用户数", "客户", "用户", "买家数"]:
-        metric = "customers"
-    elif ai_info in ["今天", "今日", "当天"]:
-        time_info = {"type": "today"}
-    elif ai_info in ["昨天", "昨日", "前一天"]:
-        time_info = {"type": "yesterday"}
-    elif "最近" in ai_info and "天" in ai_info:
-        import re
-        days_match = re.search(r'(\d+)', ai_info)
-        days = int(days_match.group(1)) if days_match else 7
-        time_info = {"type": "week", "value": days}
-    elif ai_info in ["本月", "这个月", "当月"]:
-        time_info = {"type": "month"}
-    elif ai_info in ["今年", "本年", "当年"]:
-        time_info = {"type": "year"}
-    elif "年" in ai_info and "月" in ai_info:
-        import re
-        year_match = re.search(r'(\d{4})年', ai_info)
-        month_match = re.search(r'(\d{1,2})月', ai_info)
-        if year_match and month_match:
-            time_info = {
-                "type": "custom",
-                "year": int(year_match.group(1)),
-                "month": int(month_match.group(1))
-            }
-    else:
-        # 可能是商品种类
-        cursor.execute("SELECT category_id, category_name FROM category WHERE category_name = %s", (ai_info,))
-        category_result = cursor.fetchone()
-        if category_result:
-            category_info = {
-                "category_id": category_result['category_id'],
-                "category_name": category_result['category_name']
-            }
-    
-    # 如果没有识别到指标，尝试从原始查询文本中提取
-    if not metric:
-        metric = extract_metric_from_text(query_text)
-    
-    # 如果没有识别到时间，尝试从原始查询文本中提取
-    if not time_info:
-        time_info = extract_time_info(query_text)
-    
-    # 如果没有识别到商品种类，尝试从原始查询文本中提取
-    if not category_info:
-        category_info = extract_category_info(query_text, cursor)
-    
-    if not metric:
-        return None
-    
-    return {
-        "time": time_info or {"type": "week", "value": 7},
-        "category": category_info,
-        "metric": metric,
-        "actual_data": actual_data
-    }
-
-def parse_query(query_text):
-    """解析自然语言查询"""
-    query_text = query_text.lower()
-    
-    # 提取时间信息
-    time_info = extract_time_info(query_text)
-    
-    # 提取商品种类信息
-    category_info = extract_category_info(query_text)
-    
-    # 提取指标信息
-    metric_info = extract_metric_info(query_text)
-    
-    if not metric_info:
-        return None
-    
-    return {
-        'time': time_info,
-        'category': category_info,
-        'metric': metric_info
-    }
-
-def extract_time_info(text):
-    """提取时间信息"""
-    # 匹配各种时间表达
-    patterns = {
-        'today': r'今天|今日',
-        'yesterday': r'昨天|昨日',
-        'week': r'近.*?天|最近.*?天|过去.*?天',
-        'month': r'本月|这个月|当月',
-        'year': r'今年|本年|当年',
-        'custom': r'(\d{4})年(\d{1,2})月'
-    }
-    
-    for key, pattern in patterns.items():
-        if re.search(pattern, text):
-            if key == 'week':
-                # 提取天数
-                match = re.search(r'(\d+)天', text)
-                if match:
-                    return {'type': 'days', 'value': int(match.group(1))}
-            elif key == 'custom':
-                match = re.search(pattern, text)
-                if match:
-                    year = int(match.group(1))
-                    month = int(match.group(2))
-                    return {'type': 'month', 'year': year, 'month': month}
-            else:
-                return {'type': key}
-    
-    return {'type': 'week', 'value': 7}  # 默认最近7天
-
-def extract_category_info(text):
-    """提取商品种类信息"""
-    # 查询所有商品种类
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        cursor.execute("SELECT category_id, category_name FROM category WHERE status = 1")
-        categories = cursor.fetchall()
-        
-        for category in categories:
-            if category['category_name'] in text:
-                return {
-                    'category_id': category['category_id'],
-                    'category_name': category['category_name']
-                }
-    except:
-        pass
-    finally:
-        conn.close()
-    
-    return None
-
-def extract_metric_info(text):
-    """提取指标信息"""
-    metrics = {
-        'sales': ['销售额', '销售金额', '营业额', '收入'],
-        'quantity': ['销量', '销售量', '数量', '件数'],
-        'orders': ['订单数', '订单量', '订单'],
-        'customers': ['客户数', '客户量', '用户数']
-    }
-    
-    for metric, keywords in metrics.items():
-        for keyword in keywords:
-            if keyword in text:
-                return metric
-    
-    return None
-
-def extract_metric_from_text(text):
-    """从文本中提取指标信息（与extract_metric_info功能相同）"""
-    return extract_metric_info(text)
-
-def execute_parsed_query(cursor, parsed_query):
-    """执行解析后的查询"""
-    time_info = parsed_query['time']
-    category_info = parsed_query['category']
-    metric = parsed_query['metric']
-    
-    # 构建时间条件
-    time_condition = build_time_condition(time_info)
-    
-    # 构建种类条件
-    category_condition = ""
-    params = []
-    
-    if category_info:
-        category_condition = "AND g.category_id = %s"
-        params.append(category_info['category_id'])
-    
-    # 根据指标类型构建查询
-    if metric == 'sales':
-        sql = f"""
-            SELECT SUM(o.total_amount) as value
-            FROM orders o
-            LEFT JOIN order_detail od ON o.order_id = od.order_id
-            LEFT JOIN goods g ON od.goods_id = g.goods_id
-            WHERE {time_condition} AND o.status != 'cancelled' {category_condition}
-        """
-    elif metric == 'quantity':
-        sql = f"""
-            SELECT SUM(od.quantity) as value
-            FROM order_detail od
-            LEFT JOIN orders o ON od.order_id = o.order_id
-            LEFT JOIN goods g ON od.goods_id = g.goods_id
-            WHERE {time_condition} AND o.status != 'cancelled' {category_condition}
-        """
-    elif metric == 'orders':
-        sql = f"""
-            SELECT COUNT(*) as value
-            FROM orders o
-            LEFT JOIN order_detail od ON o.order_id = od.order_id
-            LEFT JOIN goods g ON od.goods_id = g.goods_id
-            WHERE {time_condition} AND o.status != 'cancelled' {category_condition}
-        """
-    elif metric == 'customers':
-        sql = f"""
-            SELECT COUNT(DISTINCT o.user_id) as value
-            FROM orders o
-            LEFT JOIN order_detail od ON o.order_id = od.order_id
-            LEFT JOIN goods g ON od.goods_id = g.goods_id
-            WHERE {time_condition} AND o.status != 'cancelled' {category_condition}
-        """
-    
-    cursor.execute(sql, params)
-    result = cursor.fetchone()
-    
-    return {
-        'metric': metric,
-        'value': result['value'] or 0,
-        'category': category_info['category_name'] if category_info else '全部',
-        'time_period': format_time_period(time_info)
-    }
-
-def build_time_condition(time_info):
-    """构建时间查询条件"""
-    if time_info['type'] == 'today':
-        return "DATE(o.create_time) = CURDATE()"
-    elif time_info['type'] == 'yesterday':
-        return "DATE(o.create_time) = DATE_SUB(CURDATE(), INTERVAL 1 DAY)"
-    elif time_info['type'] == 'week':
-        days = time_info.get('value', 7)
-        return f"DATE(o.create_time) >= DATE_SUB(CURDATE(), INTERVAL {days} DAY)"
-    elif time_info['type'] == 'month':
-        return "DATE_FORMAT(o.create_time, '%Y-%m') = DATE_FORMAT(CURDATE(), '%Y-%m')"
-    elif time_info['type'] == 'year':
-        return "YEAR(o.create_time) = YEAR(CURDATE())"
-    elif time_info['type'] == 'custom':
-        year = time_info['year']
-        month = time_info['month']
-        return f"YEAR(o.create_time) = {year} AND MONTH(o.create_time) = {month}"
-    
-    return "DATE(o.create_time) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)"
-
-def format_time_period(time_info):
-    """格式化时间周期显示"""
-    if time_info['type'] == 'today':
-        return '今天'
-    elif time_info['type'] == 'yesterday':
-        return '昨天'
-    elif time_info['type'] == 'week':
-        days = time_info.get('value', 7)
-        return f'最近{days}天'
-    elif time_info['type'] == 'month':
-        return '本月'
-    elif time_info['type'] == 'year':
-        return '今年'
-    elif time_info['type'] == 'custom':
-        return f"{time_info['year']}年{time_info['month']}月"
-    
-    return '最近7天'
-
-def sales_prediction():
-    """使用AI增强的商品种类销量预测"""
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        
-        # 获取历史销售数据
-        historical_data = get_historical_sales_data()
-        
-        # 获取市场上下文信息
-        market_context = get_market_context()
-        
-        # 使用AI进行预测
+        conn = get_db_connection()
         try:
-            ai_prediction_result = ai_service.generate_sales_prediction(historical_data, market_context)
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
+            cursor.execute(sql, params)
+            result = cursor.fetchone()
+            value = result['value'] if result and result['value'] is not None else 0
+        except Exception as e:
+            return {"code": 0, "msg": f"数据查询失败: {safe_format_error(str(e))}", "data": {}}
+        finally:
+            conn.close()
+        
+        # 4. 导出数据到CSV
+        csv_path = sales_ai_service.export_query_data_to_csv(query_text, parsed_query, value, user_id)
+        
+        # 5. 使用LLM处理查询
+        llm_result = sales_ai_service.process_query_with_llm(query_text, csv_path, metric)
+        if not llm_result["success"]:
+            return {"code": 0, "msg": "API调用失败", "data": {}}
+        
+        # 6. 写入查询日志
+        save_query_log(user_id, query_text, llm_result["data"])
+        
+        # 7. 返回结果
+        return {"code": 1, "msg": "查询成功", "data": llm_result["data"]}
+        
+    except Exception as e:
+        # 安全处理异常消息，避免格式化错误
+        error_msg = str(e).replace('{', '{{').replace('}', '}}')
+        return {"code": 0, "msg": f"处理查询失败: {error_msg}", "data": {}}
+
+def get_query_history(user_id: int, page: int = 1, page_size: int = 10) -> dict:
+    """获取用户的查询历史记录
+    
+    Args:
+        user_id: 用户ID
+        page: 页码
+        page_size: 每页记录数
+        
+    Returns:
+        dict: 包含code、msg和data的响应结果
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
             
-            if ai_prediction_result["success"]:
-                # 使用AI预测结果
-                ai_predictions = ai_prediction_result["predictions"]
-                predictions = []
+            # 计算偏移量
+            offset = (page - 1) * page_size
+            
+            # 查询总记录数
+            cursor.execute("SELECT COUNT(*) as total FROM query_log WHERE user_id = %s", (user_id,))
+            total = cursor.fetchone()['total']
+            
+            # 查询当前页数据
+            cursor.execute("""
+                SELECT query_id, query_text, query_result, query_time 
+                FROM query_log 
+                WHERE user_id = %s 
+                ORDER BY query_time DESC 
+                LIMIT %s OFFSET %s
+            """, (user_id, page_size, offset))
+            history = cursor.fetchall()
+            
+            # 处理JSON字段
+            for item in history:
+                if item['query_result']:
+                    try:
+                        item['query_result'] = json.loads(item['query_result'])
+                    except:
+                        item['query_result'] = {}
                 
-                for pred in ai_predictions:
-                    # 获取商品种类ID，如果找不到则使用模糊匹配
-                    cursor.execute("SELECT category_id FROM category WHERE category_name = %s", (pred["category_name"],))
-                    category_result = cursor.fetchone()
-                    
-                    if not category_result:
-                        # 尝试模糊匹配
-                        cursor.execute("SELECT category_id, category_name FROM category WHERE category_name LIKE %s", (f"%{pred['category_name']}%",))
-                        category_result = cursor.fetchone()
-                    
-                    if category_result:
-                        predictions.append({
-                            'category_id': category_result['category_id'],
-                            'category_name': category_result.get('category_name', pred['category_name']),
-                            'predicted_sales': pred['predicted_sales'],
-                            'demand_level': pred['demand_level'],
-                            'confidence': pred.get('confidence', 0.8),
-                            'growth_rate': pred.get('growth_rate', 0),
-                            'reasoning': pred.get('reasoning', ''),
-                            'ai_enhanced': True
-                        })
-                        print(f"AI预测匹配成功: {pred['category_name']} -> {category_result.get('category_name', pred['category_name'])}")
-                    else:
-                        print(f"AI预测种类未找到: {pred['category_name']}")
-            else:
-                # AI预测失败，回退到传统预测方法
-                predictions = fallback_prediction_method(cursor)
-                
-        except Exception as ai_error:
-            # AI服务完全失败，回退到传统预测方法
-            print(f"AI预测服务异常: {str(ai_error)}")
-            predictions = fallback_prediction_method(cursor)
+                # 格式化时间
+                if isinstance(item['query_time'], datetime):
+                    item['query_time'] = item['query_time'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            return {
+                "code": 1,
+                "msg": "获取成功",
+                "data": {
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": (total + page_size - 1) // page_size,
+                    "history": history
+                }
+            }
+        except Exception as e:
+            return {"code": 0, "msg": f"查询历史记录失败: {safe_format_error(str(e))}", "data": {}}
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"code": 0, "msg": f"数据库连接失败: {safe_format_error(str(e))}", "data": {}}
+
+def save_query_log(user_id: int, query_text: str, query_result: dict) -> bool:
+    """保存查询日志
+    
+    Args:
+        user_id: 用户ID
+        query_text: 查询文本
+        query_result: 查询结果
+        
+    Returns:
+        bool: 是否保存成功
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            
+            # 将查询结果转换为JSON字符串
+            result_json = json.dumps(query_result, ensure_ascii=False, cls=DecimalEncoder)
+            
+            # 插入日志
+            cursor.execute(
+                "INSERT INTO query_log (user_id, query_text, query_result, query_time) VALUES (%s, %s, %s, NOW())",
+                (user_id, query_text, result_json)
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            print(f"保存查询日志失败: {safe_format_error(str(e))}")
+            return False
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"数据库连接失败: {safe_format_error(str(e))}")
+        return False
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("ai_prediction.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("ai_prediction")
+
+# ===== 销量预测模块 =====
+def sales_prediction() -> dict:
+    """执行销量预测
+    
+    Returns:
+        dict: 包含code、msg和data的响应结果
+    """
+    try:
+        logger.info("开始执行销量预测")
+        
+        # 1. 导出历史销售数据
+        logger.info("正在导出历史销售数据")
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
+            historical_data_path = sales_ai_service.export_historical_sales_data(cursor)
+            logger.info(f"历史数据导出成功: {historical_data_path}")
+        except Exception as e:
+            logger.error(f"导出历史数据失败: {safe_format_error(str(e))}")
+            return {"code": 0, "msg": f"导出历史数据失败: {safe_format_error(str(e))}", "data": {}}
+        finally:
+            conn.close()
+        
+        # 2. 检查历史数据是否存在及内容
+        if not os.path.exists(historical_data_path):
+            logger.error(f"历史数据文件不存在: {historical_data_path}")
+            return {"code": 0, "msg": "历史数据文件不存在", "data": {}}
+        
+        # 检查历史数据内容
+        try:
+            with open(historical_data_path, 'r', encoding='utf-8') as f:
+                historical_data = json.load(f)
+                if not historical_data:
+                    logger.warning("历史数据为空")
+                else:
+                    logger.info(f"历史数据包含 {len(historical_data)} 条记录")
+        except Exception as e:
+            logger.error(f"读取历史数据失败: {safe_format_error(str(e))}")
+            return {"code": 0, "msg": f"读取历史数据失败: {safe_format_error(str(e))}", "data": {}}
+        
+        # 3. 使用LLM进行预测
+        logger.info("正在调用LLM进行销量预测")
+        try:
+            # 使用SiliconFlow客户端进行预测
+            logger.info("尝试使用SiliconFlow客户端")
+            llm_result = sales_ai_service.process_prediction_with_llm(historical_data_path)
+            if not llm_result["success"]:
+                error_msg = llm_result.get("error", "未知错误")
+                logger.error(f"AI预测失败: {error_msg}")
+                return {"code": 0, "msg": f"AI预测失败: {error_msg}", "data": {}}
+        except Exception as e:
+            logger.error(f"预测过程中发生异常: {safe_format_error(str(e))}")
+            return {"code": 0, "msg": f"预测过程异常: {safe_format_error(str(e))}", "data": {}}
+        
+        logger.info("LLM预测调用成功")
+        
+        # 4. 获取预测数据
+        prediction_data = llm_result["data"]
+        predictions = prediction_data.get("predictions", [])
         
         if not predictions:
-            return jsonify({"code": 0, "msg": "没有足够的历史数据用于预测"})
+            logger.warning("未生成预测结果")
+            return {"code": 0, "msg": "未生成预测结果", "data": {}}
         
-        # 保存预测结果
-        prediction_date = datetime.now().date()
+        logger.info(f"生成了 {len(predictions)} 条预测结果")
         
-        # 先删除当天的旧预测数据
-        cursor.execute("DELETE FROM sales_prediction WHERE prediction_date = %s", (prediction_date,))
+        # 5. 验证并增强预测结果
+        # 重新连接数据库以获取基期数据
+        conn_for_base = get_db_connection()
+        try:
+            cursor_for_base = conn_for_base.cursor(pymysql.cursors.DictCursor)
+            enhanced_predictions = sales_ai_service.validate_and_enhance_predictions(predictions, cursor_for_base)
+        finally:
+            conn_for_base.close()
         
-        # 插入新的预测数据
-        for pred in predictions:
-            cursor.execute("""
-                INSERT INTO sales_prediction 
-                (category_id, category_name, predicted_sales, demand_level, prediction_date)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (pred['category_id'], pred['category_name'], pred['predicted_sales'], 
-                  pred['demand_level'], prediction_date))
+        # 6. 保存预测结果到数据库
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        save_prediction_results(enhanced_predictions, current_date)
         
-        conn.commit()
-        
-        return jsonify({
+        # 7. 返回结果
+        return {
             "code": 1,
-            "msg": "AI预测完成",
+            "msg": "预测成功",
             "data": {
-                "predictions": predictions,
-                "prediction_date": prediction_date.strftime('%Y-%m-%d'),
-                "ai_enhanced": ai_prediction_result["success"],
-                "ai_analysis": ai_prediction_result.get("ai_analysis", {})
+                "predictions": enhanced_predictions,
+                "prediction_date": current_date
             }
-        })
+        }
         
     except Exception as e:
-        import traceback
-        error_detail = traceback.format_exc()
-        print(f"预测功能异常: {str(e)}")
-        print(f"详细错误信息: {error_detail}")
-        return jsonify({"code": 0, "msg": f"预测失败：{str(e)}", "detail": error_detail})
-    finally:
-        conn.close()
+        return {"code": 0, "msg": f"预测过程失败: {safe_format_error(str(e))}", "data": {}}
 
-def get_market_context():
-    """获取市场上下文信息"""
-    conn = get_db_connection()
+def get_prediction_history(page: int = 1, page_size: int = 10) -> dict:
+    """获取销量预测历史记录
+    
+    Args:
+        page: 页码
+        page_size: 每页记录数
+        
+    Returns:
+        dict: 包含code、msg和data的响应结果
+    """
     try:
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        
-        # 获取市场趋势数据
-        cursor.execute("""
-            SELECT 
-                DATE_FORMAT(create_time, '%Y-%m') as month,
-                COUNT(*) as order_count,
-                SUM(total_amount) as total_revenue,
-                AVG(total_amount) as avg_order_value,
-                COUNT(DISTINCT user_id) as unique_customers
-            FROM orders 
-            WHERE create_time >= DATE_SUB(NOW(), INTERVAL 6 MONTH) 
-            AND status != 'cancelled'
-            GROUP BY DATE_FORMAT(create_time, '%Y-%m')
-            ORDER BY month
-        """)
-        
-        market_data = cursor.fetchall()
-        
-        # 计算市场趋势
-        if len(market_data) >= 2:
-            latest_month = market_data[-1]
-            previous_month = market_data[-2]
+        logger.info(f"开始获取预测历史记录，页码: {page}, 每页数量: {page_size}")
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
             
-            revenue_growth = ((latest_month['total_revenue'] - previous_month['total_revenue']) / 
-                            previous_month['total_revenue'] * 100) if previous_month['total_revenue'] > 0 else 0
+            # 计算偏移量
+            offset = (page - 1) * page_size
             
-            order_growth = ((latest_month['order_count'] - previous_month['order_count']) / 
-                          previous_month['order_count'] * 100) if previous_month['order_count'] > 0 else 0
+            # 查询总记录数
+            cursor.execute("SELECT COUNT(DISTINCT prediction_date) as total FROM sales_prediction")
+            total = cursor.fetchone()['total']
+            logger.info(f"预测历史总记录数: {total}")
             
-            market_context = {
-                "market_trends": market_data,
-                "revenue_growth_rate": revenue_growth,
-                "order_growth_rate": order_growth,
-                "current_performance": latest_month,
-                "seasonal_factors": "基于历史数据的季节性分析",
-                "market_conditions": "正常市场环境"
-            }
-        else:
-            market_context = {
-                "market_trends": market_data,
-                "insufficient_data": True,
-                "market_conditions": "数据不足，基于有限信息分析"
-            }
-        
-        return json.dumps(market_context, ensure_ascii=False, indent=2, cls=DecimalEncoder)
-        
-    except Exception as e:
-        return f"市场上下文获取失败: {str(e)}"
-    finally:
-        conn.close()
-
-def fallback_prediction_method(cursor):
-    """传统预测方法（作为AI预测的回退方案）"""
-    print("使用传统预测方法...")
-    try:
-        # 获取近6个月的销售数据，如果没有数据则使用所有历史数据
-        six_months_ago = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
-        
-        # 先检查是否有最近6个月的数据
-        cursor.execute("""
-            SELECT COUNT(*) as count 
-            FROM orders 
-            WHERE DATE(create_time) >= %s AND status != 'cancelled'
-        """, (six_months_ago,))
-        
-        recent_count = cursor.fetchone()['count']
-        print(f"最近6个月有效订单数: {recent_count}")
-        
-        if recent_count > 0:
-            # 使用最近6个月数据
+            # 查询当前页数据（按预测日期分组，获取最新的预测结果）
+            # 使用派生表替代LIMIT & IN子查询语法，以兼容各MySQL版本
             cursor.execute("""
                 SELECT 
-                    c.category_id,
-                    c.category_name,
-                    DATE_FORMAT(o.create_time, '%Y-%m') as month,
-                    SUM(od.quantity) as monthly_sales
-                FROM order_detail od
-                LEFT JOIN goods g ON od.goods_id = g.goods_id
-                LEFT JOIN category c ON g.category_id = c.category_id
-                LEFT JOIN orders o ON od.order_id = o.order_id
-                WHERE DATE(o.create_time) >= %s AND o.status != 'cancelled'
-                GROUP BY c.category_id, c.category_name, DATE_FORMAT(o.create_time, '%Y-%m')
-                ORDER BY c.category_id, month
-            """, (six_months_ago,))
-        else:
-            # 使用所有历史数据
-            print("使用所有历史数据...")
-            cursor.execute("""
-                SELECT 
-                    c.category_id,
-                    c.category_name,
-                    DATE_FORMAT(o.create_time, '%Y-%m') as month,
-                    SUM(od.quantity) as monthly_sales
-                FROM order_detail od
-                LEFT JOIN goods g ON od.goods_id = g.goods_id
-                LEFT JOIN category c ON g.category_id = c.category_id
-                LEFT JOIN orders o ON od.order_id = o.order_id
-                WHERE o.status != 'cancelled'
-                GROUP BY c.category_id, c.category_name, DATE_FORMAT(o.create_time, '%Y-%m')
-                ORDER BY c.category_id, month
-            """)
-        
-        sales_data = cursor.fetchall()
-        print(f"传统预测获取到销售数据: {len(sales_data)} 条记录")
-        
-        if not sales_data:
-            print("没有销售数据，返回空预测")
-            return []
-        
-        # 转换为字典进行分析
-        sales_dict = {}
-        for item in sales_data:
-            category_id = item['category_id']
-            if category_id not in sales_dict:
-                sales_dict[category_id] = []
-            sales_dict[category_id].append(item)
-        
-        print(f"按种类分组后: {len(sales_dict)} 个种类")
-        
-        # 按种类分组进行预测
-        predictions = []
-        for category_id, items in sales_dict.items():
-            if not items:
-                continue
-                
-            category_name = items[0]['category_name']
+                    sp.prediction_id,
+                    sp.category_id,
+                    sp.category_name,
+                    sp.predicted_sales,
+                    sp.demand_level,
+                    sp.accuracy_rate,
+                    sp.prediction_date,
+                    sp.create_time,
+                    c.category_name as actual_category_name
+                FROM sales_prediction sp
+                LEFT JOIN category c ON sp.category_id = c.category_id
+                INNER JOIN (
+                    SELECT DISTINCT prediction_date 
+                    FROM sales_prediction 
+                    ORDER BY prediction_date DESC 
+                    LIMIT %s OFFSET %s
+                ) AS p ON sp.prediction_date = p.prediction_date
+                ORDER BY sp.prediction_date DESC, sp.category_name
+            """, (page_size, offset))
+            history = cursor.fetchall()
             
-            # 使用简单移动平均法预测
-            monthly_sales = [item['monthly_sales'] for item in items]
+            # 格式化时间并重新计算增长率
+            # 获取基期销量数据用于重新计算增长率
+            base_sales_dict = sales_ai_service.get_base_period_sales(cursor)
             
-            if len(monthly_sales) >= 3:
-                # 计算3个月移动平均
-                predicted_sales = int(sum(monthly_sales[-3:]) / len(monthly_sales[-3:]))
+            for item in history:
+                if isinstance(item['prediction_date'], datetime):
+                    item['prediction_date'] = item['prediction_date'].strftime('%Y-%m-%d')
+                if isinstance(item['create_time'], datetime):
+                    item['create_time'] = item['create_time'].strftime('%Y-%m-%d %H:%M:%S')
                 
-                # 计算需求等级
-                if len(monthly_sales) >= 2:
-                    previous_value = monthly_sales[-2]
-                    if previous_value and previous_value != 0:
-                        growth_rate = (monthly_sales[-1] - previous_value) / previous_value * 100
-                    else:
-                        growth_rate = 0
-                    if growth_rate >= 15:
-                        demand_level = 'high'
-                    elif growth_rate >= 0:
-                        demand_level = 'medium'
-                    else:
-                        demand_level = 'low'
+                # 安全处理accuracy_rate字段，可能是Decimal类型
+                accuracy_rate = item.get('accuracy_rate', 50)
+                if isinstance(accuracy_rate, Decimal):
+                    accuracy_rate = float(accuracy_rate)
+                elif accuracy_rate is None:
+                    accuracy_rate = 50
                 else:
-                    demand_level = 'medium'
+                    try:
+                        accuracy_rate = float(accuracy_rate)
+                    except (ValueError, TypeError):
+                        accuracy_rate = 50
                 
-                predictions.append({
-                    'category_id': category_id,
-                    'category_name': category_name,
-                    'predicted_sales': predicted_sales,
-                    'demand_level': demand_level,
-                    'growth_rate': growth_rate if len(monthly_sales) >= 2 else 0,
-                    'ai_enhanced': False
-                })
-        
-        return predictions
-        
+                # 使用新的增长率计算方法：(AI预测量-基期)/基期（不乘以100）
+                category_id = item.get('category_id', 0)
+                predicted_sales = float(item.get('predicted_sales', 0))
+                base_sales = base_sales_dict.get(category_id, 0.0)
+                
+                if base_sales > 0:
+                    growth_rate = (predicted_sales - base_sales) / base_sales
+                    item['growth_rate'] = round(growth_rate, 3)  # 保留3位小数，不乘以100
+                else:
+                    # 如果基期销量为0，使用accuracy_rate/1000作为备用方案（对应原来的/10/100）
+                    item['growth_rate'] = round(accuracy_rate / 1000, 3)
+                
+                # 补充置信度字段
+                item['confidence'] = round(accuracy_rate / 100, 2)
+                
+                # 补充ai_enhanced字段
+                item['ai_enhanced'] = True
+                
+                # 使用实际的种类名称
+                if item.get('actual_category_name'):
+                    item['category_name'] = item['actual_category_name']
+                
+                # 移除不需要的字段
+                if 'actual_category_name' in item:
+                    del item['actual_category_name']
+            
+            # 按预测日期分组（为了前端兼容性，同时返回扁平数据）
+            grouped_history = {}
+            for item in history:
+                date = item['prediction_date']
+                if date not in grouped_history:
+                    grouped_history[date] = []
+                grouped_history[date].append(item)
+            
+            # 为了更好的前端渲染，直接返回扁平的历史记录
+            # 前端可以根据需要进行分组处理
+            logger.info(f"成功获取 {len(history)} 条预测历史记录")
+            return {
+                "code": 1,
+                "msg": "获取成功",
+                "data": {
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": (total + page_size - 1) // page_size,
+                    "history": history  # 直接返回扁平化的历史记录
+                }
+            }
+        except Exception as e:
+            logger.error(f"查询预测历史失败: {safe_format_error(str(e))}")
+            return {"code": 0, "msg": f"查询预测历史失败: {safe_format_error(str(e))}", "data": {}}
+        finally:
+            conn.close()
     except Exception as e:
+        logger.error(f"数据库连接失败: {safe_format_error(str(e))}")
+        return {"code": 0, "msg": f"数据库连接失败: {safe_format_error(str(e))}", "data": {}}
+
+def save_prediction_results(predictions: list, prediction_date: str) -> bool:
+    """保存预测结果到数据库
+    
+    Args:
+        predictions: 预测结果列表
+        prediction_date: 预测日期
+        
+    Returns:
+        bool: 是否保存成功
+    """
+    try:
+        logger.info(f"开始保存预测结果到数据库，预测日期: {prediction_date}")
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            
+            # 开启事务
+            conn.begin()
+            
+            # 先删除当天的预测结果（如果有）
+            cursor.execute(
+                "DELETE FROM sales_prediction WHERE prediction_date = %s",
+                (prediction_date,)
+            )
+            
+            # 插入新的预测结果
+            count = 0
+            for pred in predictions:
+                # accuracy_rate为置信度*100
+                accuracy_rate = float(pred.get('confidence', 0.5)) * 100
+                
+                # 获取种类名称，确保不为空
+                category_name = pred.get('category_name', '未知')
+                if not category_name or category_name.strip() == '':
+                    category_name = '未知'
+                    logger.warning(f"种类ID {pred.get('category_id', 0)} 缺少种类名称，使用默认值")
+                
+                cursor.execute(
+                    """
+                    INSERT INTO sales_prediction (
+                        category_id,
+                        category_name,
+                        predicted_sales,
+                        demand_level,
+                        accuracy_rate,
+                        prediction_date,
+                        create_time
+                    ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        pred.get('category_id', 0),
+                        category_name,
+                        pred.get('predicted_sales', 0),
+                        pred.get('demand_level', 'medium'),
+                        round(accuracy_rate, 2),
+                        prediction_date
+                    )
+                )
+                count += 1
+            
+            # 提交事务
+            conn.commit()
+            logger.info(f"成功保存 {count} 条预测结果到数据库")
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"保存预测结果失败: {safe_format_error(str(e))}")
+            return False
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"数据库连接失败: {safe_format_error(str(e))}")
+        return False
+
+# ===== 数据库查询辅助函数 =====
+def get_sales_data_by_time_range(start_date: str, end_date: str, category_id: int = None) -> list:
+    """获取指定时间范围内的销售数据
+    
+    Args:
+        start_date: 开始日期 (YYYY-MM-DD)
+        end_date: 结束日期 (YYYY-MM-DD)
+        category_id: 商品种类ID（可选）
+        
+    Returns:
+        list: 销售数据列表
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
+            
+            # 构建SQL查询
+            sql = """
+                SELECT 
+                    DATE(o.create_time) as sale_date,
+                    g.category_id,
+                    c.category_name,
+                    COUNT(DISTINCT o.order_id) as order_count,
+                    SUM(od.quantity) as total_quantity,
+                    SUM(od.subtotal) as total_sales
+                FROM orders o
+                LEFT JOIN order_detail od ON o.order_id = od.order_id
+                LEFT JOIN goods g ON od.goods_id = g.goods_id
+                LEFT JOIN category c ON g.category_id = c.category_id
+                WHERE o.status IN ('shipped', 'completed')
+                AND DATE(o.create_time) BETWEEN %s AND %s
+            """
+            
+            params = [start_date, end_date]
+            
+            # 添加商品种类条件
+            if category_id:
+                sql += " AND g.category_id = %s"
+                params.append(category_id)
+            
+            # 添加分组和排序
+            sql += " GROUP BY DATE(o.create_time), g.category_id, c.category_name"
+            sql += " ORDER BY sale_date, g.category_id"
+            
+            cursor.execute(sql, params)
+            return cursor.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"获取销售数据失败: {safe_format_error(str(e))}")
         return []
 
-def get_prediction_history():
-    """获取预测历史记录"""
-    conn = get_db_connection()
+def get_category_sales_summary(category_id: int) -> dict:
+    """获取指定商品种类的销售汇总
+    
+    Args:
+        category_id: 商品种类ID
+        
+    Returns:
+        dict: 销售汇总数据
+    """
     try:
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        
-        cursor.execute("""
-            SELECT 
-                prediction_date,
-                category_name,
-                predicted_sales,
-                demand_level,
-                create_time
-            FROM sales_prediction
-            ORDER BY prediction_date DESC, category_name
-        """)
-        
-        history = cursor.fetchall()
-        
-        return jsonify({
-            "code": 1,
-            "msg": "获取成功",
-            "data": history
-        })
-        
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
+            
+            sql = """
+                SELECT 
+                    SUM(od.quantity) as total_quantity,
+                    SUM(od.subtotal) as total_sales,
+                    COUNT(DISTINCT o.order_id) as order_count
+                FROM order_detail od
+                LEFT JOIN goods g ON od.goods_id = g.goods_id
+                LEFT JOIN orders o ON od.order_id = o.order_id
+                WHERE o.status IN ('shipped', 'completed')
+                AND g.category_id = %s
+            """
+            
+            cursor.execute(sql, (category_id,))
+            result = cursor.fetchone()
+            
+            # 处理空结果
+            if not result:
+                return {"total_quantity": 0, "total_sales": 0, "order_count": 0}
+            
+            return result
+        finally:
+            conn.close()
     except Exception as e:
-        return jsonify({"code": 0, "msg": f"获取失败：{str(e)}"})
-    finally:
-        conn.close()
+        print(f"获取分类销售汇总失败: {safe_format_error(str(e))}")
+        return {"total_quantity": 0, "total_sales": 0, "order_count": 0}

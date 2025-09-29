@@ -100,12 +100,13 @@
                                 <th>商品种类</th>
                                 <th>预测销量</th>
                                 <th>需求等级</th>
+                                <th>增长率</th>
                                 <th>预测时间</th>
                             </tr>
                         </thead>
                         <tbody id="predictionHistoryTable">
                             <tr>
-                                <td colspan="5" class="text-center">加载中...</td>
+                                <td colspan="6" class="text-center">加载中...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -174,24 +175,48 @@ function runPrediction() {
     const originalText = btn.innerHTML;
     showLoading(btn);
     
-    apiRequest('/ai/prediction', 'POST')
-        .then(response => {
+    // 直接使用完整路径，不经过API_BASE
+    fetch('/ai/prediction', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        }
+    })
+        .then(async (response) => {
             hideLoading(btn, originalText);
             
-            if (response.code === 1) {
-                showMessage('预测完成', 'success');
-                displayPredictionResults(response.data.predictions);
-                updatePredictionChart(response.data.predictions);
-                document.getElementById('predictionDate').textContent = `预测日期：${response.data.prediction_date}`;
-                loadPredictionHistory();
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                const data = await response.json();
+                console.log('预测接口响应:', data); // 调试信息
+                
+                if (data.code === 1) {
+                    showMessage('预测完成', 'success');
+                    const predictions = data.data.predictions;
+                    console.log('预测结果:', predictions); // 调试信息
+                    
+                    displayPredictionResults(predictions);
+                    updatePredictionChart(predictions);
+                    document.getElementById('predictionDate').textContent = `预测日期：${data.data.prediction_date}`;
+                    loadPredictionHistory();
+                } else {
+                    showMessage(data.msg, 'danger');
+                }
             } else {
-                showMessage(response.msg, 'danger');
+                const text = await response.text();
+                showMessage(`服务器错误: ${text.slice(0, 200)}`, 'danger');
             }
+        })
+        .catch(error => {
+            hideLoading(btn, originalText);
+            console.error('预测请求失败:', error);
+            showMessage('预测请求失败，请稍后重试', 'danger');
         });
 }
 
 // 显示预测结果
 function displayPredictionResults(predictions) {
+    console.log('正在显示预测结果:', predictions); // 调试信息
     const tbody = document.getElementById('predictionTableBody');
     
     if (predictions.length === 0) {
@@ -199,22 +224,53 @@ function displayPredictionResults(predictions) {
         return;
     }
     
-    tbody.innerHTML = predictions.map(pred => `
-        <tr>
-            <td>${pred.category_name}</td>
-            <td><span class="badge bg-primary">${pred.predicted_sales}</span></td>
-            <td><span class="badge bg-${getDemandLevelColor(pred.demand_level)}">${getDemandLevelText(pred.demand_level)}</span></td>
-            <td>${pred.growth_rate ? pred.growth_rate.toFixed(1) + '%' : '-'}</td>
-            <td>
-                ${pred.ai_enhanced ? 
-                    '<span class="badge bg-success"><i class="fas fa-robot me-1"></i>AI预测</span>' : 
-                    '<span class="badge bg-secondary">传统预测</span>'
-                }
-                ${pred.confidence ? `<br><small class="text-muted">置信度: ${(pred.confidence * 100).toFixed(1)}%</small>` : ''}
-            </td>
-            <td>${new Date().toLocaleString('zh-CN', {year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'})}</td>
-        </tr>
-    `).join('');
+    tbody.innerHTML = predictions.map(pred => {
+        // 详细调试信息
+        console.log(`处理预测: ${pred.category_name}, growth_rate = ${pred.growth_rate}, 类型 = ${typeof pred.growth_rate}`);
+        
+        // 安全处理增长率字段（统一显示为百分比格式）
+        let growthRateDisplay = '-';
+        if (pred.growth_rate !== null && pred.growth_rate !== undefined) {
+            const growthRate = parseFloat(pred.growth_rate);
+            console.log(`预测解析后的增长率: ${growthRate}`);
+            if (!isNaN(growthRate)) {
+                // 统一显示为百分比格式
+                growthRateDisplay = (growthRate * 100).toFixed(1) + '%';
+            } else {
+                console.warn(`预测增长率解析失败: ${pred.growth_rate}`);
+            }
+        } else {
+            console.warn(`预测增长率为空: ${pred.growth_rate}`);
+        }
+        
+        // 安全处理置信度字段
+        let confidenceDisplay = '';
+        if (pred.confidence !== null && pred.confidence !== undefined) {
+            const confidence = parseFloat(pred.confidence);
+            if (!isNaN(confidence)) {
+                confidenceDisplay = `<br><small class="text-muted">置信度: ${(confidence * 100).toFixed(1)}%</small>`;
+            }
+        }
+        
+        return `
+            <tr>
+                <td>${pred.category_name}</td>
+                <td><span class="badge bg-primary">${pred.predicted_sales}</span></td>
+                <td><span class="badge bg-${getDemandLevelColor(pred.demand_level)}">${getDemandLevelText(pred.demand_level)}</span></td>
+                <td>${growthRateDisplay}</td>
+                <td>
+                    ${pred.ai_enhanced ? 
+                        '<span class="badge bg-success"><i class="fas fa-robot me-1"></i>AI预测</span>' : 
+                        '<span class="badge bg-secondary">传统预测</span>'
+                    }
+                    ${confidenceDisplay}
+                </td>
+                <td>${new Date().toLocaleString('zh-CN', {year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'})}</td>
+            </tr>
+        `;
+    }).join('');
+    
+    console.log('预测结果表格已更新'); // 调试信息
 }
 
 // 更新预测图表
@@ -249,34 +305,79 @@ function getDemandLevelText(level) {
 
 // 加载预测历史
 function loadPredictionHistory() {
-    apiRequest('/ai/prediction-history')
-        .then(response => {
-            if (response.code === 1) {
-                displayPredictionHistory(response.data);
+    // 直接使用完整路径，不经过API_BASE
+    fetch('/ai/prediction-history', {
+        method: 'GET',
+        headers: {
+            'Content-Type': 'application/json',
+        }
+    })
+        .then(async (response) => {
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                const data = await response.json();
+                console.log('预测历史接口响应:', data); // 调试信息
+                
+                if (data.code === 1) {
+                    const history = data.data.history;
+                    console.log('预测历史数据:', history); // 调试信息
+                    displayPredictionHistory(history);
+                } else {
+                    showMessage(data.msg, 'danger');
+                }
             } else {
-                showMessage(response.msg, 'danger');
+                const text = await response.text();
+                showMessage(`加载历史失败: ${text.slice(0, 200)}`, 'danger');
             }
+        })
+        .catch(error => {
+            console.error('预测历史请求失败:', error);
+            showMessage('加载预测历史失败', 'danger');
         });
 }
 
 // 显示预测历史
 function displayPredictionHistory(history) {
+    console.log('正在显示预测历史:', history); // 调试信息
     const tbody = document.getElementById('predictionHistoryTable');
     
-    if (history.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" class="text-center">暂无预测历史</td></tr>';
+    if (!history || history.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center">暂无预测历史</td></tr>';
         return;
     }
     
-    tbody.innerHTML = history.map(item => `
-        <tr>
-            <td>${new Date(item.prediction_date).toLocaleDateString('zh-CN', {year: 'numeric', month: 'numeric', day: 'numeric'})}</td>
-            <td>${item.category_name}</td>
-            <td><span class="badge bg-primary">${item.predicted_sales}</span></td>
-            <td><span class="badge bg-${getDemandLevelColor(item.demand_level)}">${getDemandLevelText(item.demand_level)}</span></td>
-            <td>${new Date(item.create_time).toLocaleString('zh-CN', {year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'})}</td>
-        </tr>
-    `).join('');
+    tbody.innerHTML = history.map(item => {
+        // 详细调试信息
+        console.log(`处理记录: ${item.category_name}, growth_rate = ${item.growth_rate}, 类型 = ${typeof item.growth_rate}`);
+        
+        // 安全处理增长率字段（统一显示为百分比格式）
+        let growthRateDisplay = '-';
+        if (item.growth_rate !== null && item.growth_rate !== undefined) {
+            const growthRate = parseFloat(item.growth_rate);
+            console.log(`解析后的增长率: ${growthRate}`);
+            if (!isNaN(growthRate)) {
+                // 统一显示为百分比格式
+                growthRateDisplay = (growthRate * 100).toFixed(1) + '%';
+            } else {
+                console.warn(`增长率解析失败: ${item.growth_rate}`);
+            }
+        } else {
+            console.warn(`增长率为空: ${item.growth_rate}`);
+        }
+        
+        return `
+            <tr>
+                <td>${new Date(item.prediction_date).toLocaleDateString('zh-CN', {year: 'numeric', month: 'numeric', day: 'numeric'})}</td>
+                <td>${item.category_name || '未知'}</td>
+                <td><span class="badge bg-primary">${item.predicted_sales}</span></td>
+                <td><span class="badge bg-${getDemandLevelColor(item.demand_level)}">${getDemandLevelText(item.demand_level)}</span></td>
+                <td>${growthRateDisplay}</td>
+                <td>${new Date(item.create_time).toLocaleString('zh-CN', {year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'})}</td>
+            </tr>
+        `;
+    }).join('');
+    
+    console.log('预测历史表格已更新'); // 调试信息
 }
 
 // 刷新预测
